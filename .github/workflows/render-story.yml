@@ -1,0 +1,188 @@
+name: render-story
+
+# Story text -> hand-drawn video, entirely on Actions.
+#
+# scripts/story-to-video.mjs generates illustrations by calling
+# $CODEX_HOME/skills/.system/imagegen/scripts/image_gen.py, a CLI that ships
+# with Codex and is absent on a runner. tools/fal-imagegen/ implements that same
+# contract on top of fal_image.py from delphichi/2025trip, so pointing
+# CODEX_HOME at it makes --generator api work here with no renderer changes.
+#
+# Requires a FAL_KEY repository secret (Settings -> Secrets and variables ->
+# Actions), the same key the fal-image workflow in 2025TRIP uses.
+
+on:
+  workflow_dispatch:
+    inputs:
+      premise:
+        description: 'One sentence to expand into a story. Leave empty to use story_file instead.'
+        required: false
+        default: ''
+      scenes:
+        description: 'How many beats to expand the premise into (2-20)'
+        required: true
+        default: '8'
+      story_file:
+        description: 'UTF-8 story text file in this repo (ignored when premise is set)'
+        required: true
+        default: 'examples/story.txt'
+      title:
+        description: 'Video title (a premise run uses the title the model picks, unless you change this)'
+        required: true
+        default: '手绘故事'
+      style:
+        description: 'Style id, number, Chinese name, or alias (see references/handdrawn-style-library.json)'
+        required: true
+        default: 'colored-pencil-diary'
+      text_mode:
+        description: 'font = captions rendered by Remotion; image2 = captions drawn by the model'
+        required: true
+        default: 'font'
+        type: choice
+        options: [font, image2]
+      transition:
+        description: 'cut or page-flip'
+        required: true
+        default: 'cut'
+        type: choice
+        options: [cut, page-flip]
+      quality:
+        description: 'preview (720x960) or final (1080x1440)'
+        required: true
+        default: 'preview'
+        type: choice
+        options: [preview, final]
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # fal_image.py lives in the other repo; check it out rather than vendoring
+      # a copy that would drift.
+      - uses: actions/checkout@v4
+        with:
+          repository: delphichi/2025TRIP
+          path: .fal-tools
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check secret
+        env:
+          FAL_KEY: ${{ secrets.FAL_KEY }}
+        run: |
+          if [ -z "$FAL_KEY" ]; then
+            echo "FAL_KEY secret is not set (Settings -> Secrets and variables -> Actions)" >&2
+            exit 1
+          fi
+
+      - name: Ensure FFmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version | head -1
+
+      # package-lock.json pins registry.npmmirror.com; rewrite the host so the
+      # install works from GitHub-hosted runners.
+      - name: Install dependencies
+        run: npm ci --registry=https://registry.npmjs.org --replace-registry-host=always
+
+      - name: Ensure browser
+        run: npx remotion browser ensure
+
+      # One sentence in, a shot-list-shaped story out. Uses the same FAL_KEY as
+      # the illustrations, via FAL's any-llm endpoint.
+      - name: Expand premise into a story
+        if: inputs.premise != ''
+        env:
+          FAL_KEY: ${{ secrets.FAL_KEY }}
+          PREMISE: ${{ inputs.premise }}
+          SCENES: ${{ inputs.scenes }}
+        run: |
+          set -euo pipefail
+          node scripts/expand-story.mjs \
+            --premise "$PREMISE" \
+            --scenes "$SCENES" \
+            --out story.generated.txt \
+            --lock-out character-lock.generated.txt \
+            --plan-out visual-plan.generated.json
+          echo "STORY_FILE=story.generated.txt" >> "$GITHUB_ENV"
+          {
+            echo "### 展开后的故事"
+            echo '```'
+            cat story.generated.txt
+            echo '```'
+            echo "### 角色锁定"
+            echo '```'
+            cat character-lock.generated.txt
+            echo '```'
+            echo "### 镜头设计"
+            echo '```json'
+            cat visual-plan.generated.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate illustrations and storyboard
+        env:
+          FAL_KEY: ${{ secrets.FAL_KEY }}
+          FAL_IMAGE_CLI: ${{ github.workspace }}/.fal-tools/.claude/skills/fal-image-gen/scripts/fal_image.py
+          CODEX_HOME: ${{ github.workspace }}/tools/fal-imagegen
+          # story-to-video.mjs only checks that this is non-empty before taking
+          # the --generator api path; the adapter authenticates with FAL_KEY.
+          OPENAI_API_KEY: unused-images-come-from-fal
+          # Set by the expand step when a premise was given; falls back to the input.
+          STORY_FILE: ${{ env.STORY_FILE || inputs.story_file }}
+          TITLE: ${{ inputs.title }}
+          STYLE: ${{ inputs.style }}
+          TEXT_MODE: ${{ inputs.text_mode }}
+          TRANSITION: ${{ inputs.transition }}
+        run: |
+          set -euo pipefail
+          test -f "$STORY_FILE" || { echo "Story file not found: $STORY_FILE" >&2; exit 1; }
+          ARGS=(--input "$STORY_FILE" --title "$TITLE" --style "$STYLE"
+                --text-mode "$TEXT_MODE" --transition "$TRANSITION"
+                --generator api --generate --apply)
+          # The expanded story ships its own character lock; without one the
+          # renderer falls back to a generic description and faces drift.
+          if [ -s character-lock.generated.txt ]; then
+            ARGS+=(--character-lock "$(cat character-lock.generated.txt)")
+          fi
+          # Per-beat framing; without it every scene gets the same default view.
+          if [ -s visual-plan.generated.json ]; then
+            ARGS+=(--visual-plan visual-plan.generated.json)
+          fi
+          npm run story -- "${ARGS[@]}"
+          node scripts/validate-storyboard.mjs storyboard.json
+
+      - name: Render
+        run: |
+          if [ "${{ inputs.quality }}" = "final" ]; then
+            npm run render
+          else
+            npm run render:preview
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: handdrawn-story-${{ inputs.quality }}
+          path: |
+            out/*.mp4
+            storyboard.json
+            story.generated.txt
+            character-lock.generated.txt
+            visual-plan.generated.json
+            public/assets/generated/**
+            prompts/generated/**
+          retention-days: 14
+          if-no-files-found: error

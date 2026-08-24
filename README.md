@@ -177,6 +177,30 @@ python3 scripts/run_story_video.py \
 
 Skill 的完整行为约定见 [skill-package/story-to-handdrawn-video/SKILL.md](skill-package/story-to-handdrawn-video/SKILL.md)。
 
+### 在 GitHub Actions 上运行
+
+仓库内置两个工作流（`.github/workflows/`）：
+
+| 工作流 | 触发方式 | 作用 |
+| --- | --- | --- |
+| `check.yml` | push / PR / 手动 | TypeScript 检查，并用临时生成的图片跑一遍导入 + 分镜校验 |
+| `render-uploaded.yml` | 手动（workflow_dispatch） | 把 `inputs/` 目录里的有序图片渲染成视频，产物作为 artifact 下载 |
+| `render-story.yml` | 手动（workflow_dispatch） | **一句话（或故事文本）→ 出图 → 视频**，扩写与出图都交给 FAL AI（需 `FAL_KEY` secret）|
+
+渲染流程：把按顺序命名的图片（`01.png`、`02.png`…）提交到 `inputs/`，然后在 **Actions → render-uploaded → Run workflow** 里选择标题、转场（`cut` / `page-flip`）、布局、每页时长和画质（`preview` / `final`），运行结束后从 artifact 下载 `out/*.mp4`。
+
+几点限制：
+
+- **一句话变成故事，靠 `scripts/expand-story.mjs`。** 渲染器按「。！？；」切句，一句一个画面，所以只给一句话就只有一格。这个脚本把一句前提送进 FAL 的 `fal-ai/any-llm`（跟出图同一把 `FAL_KEY`），要求模型回一份已经排成分镜的故事：恰好 N 句、每句不超过 30 字、每句都能单独画出来、整体起承转合，同时给出一段角色锁定描述。角色锁定会随每张插画的提示词一起送出去，是同一个人在所有画面里长得一样的关键——没有它渲染器只会用一句很泛的默认描述，脸会飘。在 `render-story.yml` 里填 `premise` 就走这条路，留空则用 `story_file`。
+- **镜头设计也在同一次扩写里出。** 渲染器切完句只会给每格套同一句默认取景，所以八格会是同一个距离看同一个人。扩写时会一并要求模型给出与句子一一对应的 `shots`：只许用 wide / full / medium / medium close-up 四种景别，medium close-up 只留给情绪反应那一两格，且不许连续两格同景别——景别变化是这支片子唯一的节奏来源。结果写成 `visual-plan.generated.json`，经 `--visual-plan` 送进每格的 `Scene direction:`。
+- **分镜键要对齐，所以切句逻辑抽成了 `scripts/lib/split-story.mjs`。** 场景编号是按**切分后**的节拍算的，一句超过 36 字会被拆成两格，后面所有编号跟着位移。扩写脚本用同一个 `splitStory` 预先算出真实编号再写键，句子被拆开时两格沿用同一个镜头。两边共用一份实现，避免规则各自漂移。
+- **出图这步由 `tools/fal-imagegen/` 补上。** 本仓库本身不含图像生成器：`scripts/story-to-video.mjs` 的 `runImage2()` 把提示词文件和参考图交给 `$CODEX_HOME/skills/.system/imagegen/scripts/image_gen.py`，那个 CLI 属于 Codex，不在仓库里。`tools/fal-imagegen/` 用同样的接口重新实现了它，底层调 [delphichi/2025TRIP](https://github.com/delphichi/2025TRIP) 的 `fal_image.py`（FAL AI 的 `gpt-image-2`）。`render-story.yml` 只是把 `CODEX_HOME` 指过去，渲染器一行代码都不用改。需要在 Settings → Secrets 里加 `FAL_KEY`。
+- **默认的 `--generator codex` 仍然需要人。** 它不出图，只写出 `codex-image-jobs.json` 交给 agent 逐条完成，要在 CI 上跑得在 workflow 里真的跑一个 agent。`render-story.yml` 走的是 `--generator api` 这条路。
+- **不要直接在 CI 上跑 `npm run check`。** `check:storyboard` 会校验分镜引用的 PNG 是否存在，而 `public/assets/generated/` 在 `.gitignore` 里；干净检出时必然失败。工作流因此拆成 `check:types` + 针对现场生成的分镜做校验。
+- **`package-lock.json` 里的 231 个依赖都指向 `registry.npmmirror.com`。** 工作流用 `npm ci --registry=https://registry.npmjs.org --replace-registry-host=always` 改写主机名，避免从 GitHub runner 访问镜像源。
+- **需要 Chrome Headless Shell。** runner 预装的 Chrome 已移除旧版 headless 模式，Remotion 会启动失败，所以工作流里先执行 `npx remotion browser ensure`（约 150MB，从 `remotion.media` 下载；若组织限制出网需放行该域名）。
+- ffmpeg 与 ffprobe 都是必需的，工作流会在缺失时用 apt 安装。
+
 ### 项目结构
 
 ```text
@@ -345,6 +369,30 @@ The machine-readable recipes live in [references/handdrawn-style-library.json](r
 | Uploaded images | preview | `out/uploaded_picture_silent-preview.mp4` |
 
 Final 1080×1440, preview 720×960, H.264, silent. The full behavior contract lives in [SKILL.md](skill-package/story-to-handdrawn-video/SKILL.md).
+
+### GitHub Actions
+
+Two workflows ship in `.github/workflows/`:
+
+| Workflow | Trigger | What it does |
+| --- | --- | --- |
+| `check.yml` | push / PR / manual | Type check, plus an import + storyboard-validation smoke run on throwaway images |
+| `render-uploaded.yml` | manual (workflow_dispatch) | Renders the ordered images in `inputs/` and uploads the video as an artifact |
+| `render-story.yml` | manual (workflow_dispatch) | **One sentence (or a story file) → illustrations → video**, with FAL AI both expanding and drawing (needs a `FAL_KEY` secret) |
+
+Commit your pages as `inputs/01.png`, `inputs/02.png`, …, then run **Actions → render-uploaded → Run workflow** and pick title, transition, layout, page duration, and quality. Download `out/*.mp4` from the run's artifacts.
+
+Limits worth knowing:
+
+- **One sentence becomes a story via `scripts/expand-story.mjs`.** The renderer splits on 。！？； and gives every beat one illustration, so a single sentence yields a single shot. This script sends the premise to FAL's `fal-ai/any-llm` (the same `FAL_KEY` the illustrations use) and asks for a story already shaped like a shot list: exactly N sentences, each under 30 characters, each independently drawable, with a turn before the ending — plus a character lock. That lock rides along in every illustration prompt and is what keeps a character's face consistent across shots; without it the renderer falls back to a generic description and identity drifts. Fill in `premise` in `render-story.yml` to take this path, or leave it empty to use `story_file`.
+- **Shot design comes out of the same expansion.** Splitting sentences gives every beat the same default framing, so all eight shots sit at the same distance from the same subject. The expansion also asks for a `shots` array parallel to the story: only wide / full / medium / medium close-up, the close-up reserved for a reaction beat, and never the same framing twice in a row — framing is the only rhythm this format has. The result is written to `visual-plan.generated.json` and reaches each beat's `Scene direction:` via `--visual-plan`.
+- **Keys have to line up, so the splitter now lives in `scripts/lib/split-story.mjs`.** Scene ids are numbered from the *split* story, and a sentence over 36 characters becomes two beats, shifting every id after it. The expander runs the same `splitStory` to work out the real ids before writing its keys; when a sentence splits, its beats share a shot. One implementation, imported by both, so the two can't drift.
+- **Illustration generation comes from `tools/fal-imagegen/`.** This repo ships no image generator of its own: `runImage2()` in `scripts/story-to-video.mjs` hands the prompt file and reference images to `$CODEX_HOME/skills/.system/imagegen/scripts/image_gen.py`, a CLI that belongs to Codex. `tools/fal-imagegen/` reimplements that contract on top of `fal_image.py` from [delphichi/2025TRIP](https://github.com/delphichi/2025TRIP), which calls FAL AI's `gpt-image-2`. `render-story.yml` simply points `CODEX_HOME` at it — the renderer is untouched. Add a `FAL_KEY` repository secret to use it.
+- **The default `--generator codex` still needs a human (or an agent).** It draws nothing; it only emits `codex-image-jobs.json` for an agent to fulfil, so running it in CI means running an actual agent in the workflow. `render-story.yml` takes the `--generator api` path instead.
+- **Do not run `npm run check` as-is in CI.** `check:storyboard` asserts that every referenced PNG exists, and `public/assets/generated/` is gitignored, so it always fails on a clean checkout. The workflow runs `check:types` and validates a storyboard it builds during the run.
+- **`package-lock.json` resolves all 231 packages from `registry.npmmirror.com`.** The workflows install with `npm ci --registry=https://registry.npmjs.org --replace-registry-host=always`.
+- **Chrome Headless Shell is required.** The runner's preinstalled Chrome dropped old headless mode, so `npx remotion browser ensure` runs first (~150 MB from `remotion.media`; allowlist that host if egress is restricted).
+- ffmpeg and ffprobe are both required; the workflows apt-install them when missing.
 
 ### License
 

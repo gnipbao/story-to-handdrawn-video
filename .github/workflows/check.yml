@@ -1,0 +1,50 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      # package-lock.json pins registry.npmmirror.com; rewrite the host so the
+      # install works from GitHub-hosted runners.
+      - name: Install dependencies
+        run: npm ci --registry=https://registry.npmjs.org --replace-registry-host=always
+
+      - name: Type check
+        run: npm run check:types
+
+      # `npm run check:storyboard` also asserts that every referenced PNG exists,
+      # and public/assets/generated/ is gitignored — so validate a storyboard we
+      # build here instead of the committed ones.
+      - name: Ensure FFmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version | head -1
+
+      - name: Build a throwaway storyboard and validate it
+        run: |
+          mkdir -p /tmp/pages
+          ffmpeg -hide_banner -loglevel error -f lavfi -i color=c=white:s=1080x1440 \
+            -vf "drawbox=x=100:y=400:w=880:h=600:color=black@0.8:t=12" \
+            -frames:v 1 -y /tmp/pages/01.png
+          ffmpeg -hide_banner -loglevel error -f lavfi -i color=c=white:s=1080x1440 \
+            -vf "drawbox=x=200:y=300:w=600:h=800:color=black@0.8:t=20" \
+            -frames:v 1 -y /tmp/pages/02.png
+          npm run import:uploaded -- --image /tmp/pages/01.png --image /tmp/pages/02.png \
+            --title ci-smoke --layout full
+          node scripts/validate-storyboard.mjs storyboard.uploaded.json

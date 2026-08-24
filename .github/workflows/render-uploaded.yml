@@ -1,0 +1,116 @@
+name: render-uploaded
+
+# Renders a hand-drawn video from an ordered set of images that live in the
+# repository. Illustration generation is not wired up here: story-to-video.mjs
+# delegates it to $CODEX_HOME/skills/.system/imagegen/scripts/image_gen.py,
+# which ships with Codex rather than with this repo. Supply a CLI with that same
+# contract on the runner and --generator api works here too; see the README.
+
+on:
+  workflow_dispatch:
+    inputs:
+      images_dir:
+        description: 'Directory of ordered page images (sorted by filename)'
+        required: true
+        default: 'inputs'
+      title:
+        description: 'Video title (no spaces)'
+        required: true
+        default: 'handdrawn-story'
+      transition:
+        description: 'cut or page-flip'
+        required: true
+        default: 'cut'
+        type: choice
+        options: [cut, page-flip]
+      layout:
+        description: 'auto, composite, or full'
+        required: true
+        default: 'auto'
+        type: choice
+        options: [auto, composite, full]
+      page_duration:
+        description: 'Seconds per page'
+        required: true
+        default: '4.4'
+      quality:
+        description: 'preview (720x960) or final (1080x1440)'
+        required: true
+        default: 'preview'
+        type: choice
+        options: [preview, final]
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Ensure FFmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version | head -1
+
+      # package-lock.json pins registry.npmmirror.com; rewrite the host so the
+      # install works from GitHub-hosted runners.
+      - name: Install dependencies
+        run: npm ci --registry=https://registry.npmjs.org --replace-registry-host=always
+
+      # Downloads Chrome Headless Shell. The Chrome preinstalled on the runner
+      # no longer supports the old headless mode Remotion needs.
+      - name: Ensure browser
+        run: npx remotion browser ensure
+
+      - name: Build storyboard from images
+        env:
+          IMAGES_DIR: ${{ inputs.images_dir }}
+          TITLE: ${{ inputs.title }}
+          TRANSITION: ${{ inputs.transition }}
+          LAYOUT: ${{ inputs.layout }}
+          PAGE_DURATION: ${{ inputs.page_duration }}
+        run: |
+          set -euo pipefail
+          mapfile -t pages < <(find "$IMAGES_DIR" -maxdepth 1 -type f \
+            \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' \) | sort -V)
+          if [ ${#pages[@]} -eq 0 ]; then
+            echo "No images found in $IMAGES_DIR" >&2
+            exit 1
+          fi
+          printf 'Found %d pages:\n' "${#pages[@]}"
+          printf '  %s\n' "${pages[@]}"
+          args=()
+          for page in "${pages[@]}"; do
+            args+=(--image "$(realpath "$page")")
+          done
+          npm run import:uploaded -- "${args[@]}" \
+            --title "$TITLE" \
+            --transition "$TRANSITION" \
+            --layout "$LAYOUT" \
+            --page-duration "$PAGE_DURATION"
+          node scripts/validate-storyboard.mjs storyboard.uploaded.json
+
+      - name: Render
+        run: |
+          if [ "${{ inputs.quality }}" = "final" ]; then
+            npm run render:uploaded
+          else
+            npm run render:uploaded:preview
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: handdrawn-video-${{ inputs.quality }}
+          path: |
+            out/*.mp4
+            storyboard.uploaded.json
+          retention-days: 14
+          if-no-files-found: error

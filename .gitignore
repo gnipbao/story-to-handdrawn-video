@@ -14,3 +14,7 @@ uploaded-pages.json
 *.zip
 .DS_Store
 .npm-cache/
+
+story.generated.txt
+character-lock.generated.txt
+visual-plan.generated.json
